@@ -35,7 +35,6 @@ from gammapy.makers.utils import (
     make_theta_squared_table,
     project_irf_on_geom,
     integrate_project_irf_on_geom,
-    _get_fov_coord,
 )
 from gammapy.maps import HpxGeom, MapAxis, RegionGeom, WcsGeom, WcsNDMap
 from gammapy.modeling.models import ConstantSpectralModel
