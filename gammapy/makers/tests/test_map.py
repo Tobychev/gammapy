@@ -20,6 +20,7 @@ from gammapy.datasets import MapDataset, MapDatasetMetaData
 from gammapy.datasets.map import RAD_AXIS_DEFAULT
 from gammapy.irf import (
     Background2D,
+    Background3D,
     EDispKernelMap,
     EDispMap,
     PSFMap,
@@ -39,6 +40,14 @@ def observations():
 
 
 @pytest.fixture(scope="session")
+def bkg_3d():
+    filename = (
+        "$GAMMAPY_DATA/cta-1dc/caldb/data/cta/1dc/bcf/South_z20_50h/irf_file.fits"
+    )
+    return Background3D.read(filename, hdu="BACKGROUND")
+
+
+@pytest.fixture(scope="session")
 def aeff():
     filename = (
         "$GAMMAPY_DATA/cta-1dc/caldb/data/cta/1dc/bcf/South_z20_50h/irf_file.fits"
@@ -46,7 +55,62 @@ def aeff():
     return EffectiveAreaTable2D.read(filename, hdu="EFFECTIVE AREA")
 
 
-def geom(ebounds, binsz=0.5, map_type=None):
+@pytest.fixture(scope="session")
+def fixed_pointing_info():
+    filename = "$GAMMAPY_DATA/cta-1dc/data/baseline/gps/gps_baseline_110380.fits"
+    return FixedPointingInfo.read(filename)
+
+
+@pytest.fixture(scope="session")
+def fixed_pointing_info_aligned():
+    # Create Fixed Pointing Info aligned between sky and horizon coordinates
+    # (removes rotation in FoV and results in predictable solid angles)
+    fixed_icrs = SkyCoord(0 * u.deg, 0 * u.deg, frame="icrs")
+
+    return FixedPointingInfo(fixed_icrs=fixed_icrs)
+
+
+def fake_bkg_3d_custom(symmetry="constant", fov_align="RADEC"):
+    if symmetry == "constant":
+        data = np.ones((2, 3, 3))
+        sky_edges = [-3, -1, 1, 3] * u.deg
+    elif symmetry == "symmetric":
+        data = np.ones((2, 3, 3))
+        data[:, 1, 1] *= 2
+        sky_edges = [-3, -1, 1, 3] * u.deg
+    elif symmetry == "hirez_symmetric":
+        data = np.ones((3, 3))
+        data[1, 1] *= 2
+        data = (  # Upscale 3x3 to 9x9 by simply repeating
+            data.repeat(3, axis=0).repeat(3, axis=1)[np.newaxis, ...].repeat(2, axis=0)
+        )
+        sky_edges = np.linspace(-3, 3, 10) * u.deg
+    elif symmetry == "asymmetric":
+        data = np.indices((3, 3))[1] + 1
+        data = np.stack(2 * [data])
+        sky_edges = [-3, -1, 1, 3] * u.deg
+    else:
+        raise ValueError(f"Unknown value for symmetry: {symmetry}")
+
+    energy_axis = MapAxis.from_energy_edges([0.1, 10, 1000] * u.TeV)
+    fov_lon_axis = MapAxis.from_edges(sky_edges, name="fov_lon")
+    fov_lat_axis = MapAxis.from_edges(sky_edges, name="fov_lat")
+    return Background3D(
+        axes=[energy_axis, fov_lon_axis, fov_lat_axis],
+        data=data,
+        unit=u.Unit("s-1 MeV-1 sr-1"),
+        interp_kwargs=dict(bounds_error=False, fill_value=None, values_scale="log"),
+        fov_alignment=fov_align,
+        # allow extrapolation for symmetry tests
+    )
+
+
+def geom(
+    ebounds,
+    binsz=0.5,
+    skydir=None,
+    map_type=None,
+):
     if not map_type:
         skydir = SkyCoord(0, -1, unit="deg", frame="galactic")
         energy_axis = MapAxis.from_edges(
@@ -59,12 +123,17 @@ def geom(ebounds, binsz=0.5, map_type=None):
             frame="galactic",
             axes=[energy_axis],
         )
-    elif map_type == "wcs":
+    elif map_type == "wcs-true":
         axis = MapAxis.from_edges(ebounds, name="energy_true", unit="TeV", interp="log")
-        return WcsGeom.create(npix=(4, 3), binsz=2, axes=[axis])
+        return WcsGeom.create(npix=(4, 3), binsz=2, axes=[axis], skydir=skydir)
+    elif map_type == "wcs-reco":
+        axis = MapAxis.from_edges(ebounds, name="energy", unit="TeV", interp="log")
+        return WcsGeom.create(npix=(4, 3), binsz=2, axes=[axis], skydir=skydir)
     elif map_type == "hpx":
         axis = MapAxis.from_edges(ebounds, name="energy_true", unit="TeV", interp="log")
         return HpxGeom(256, axes=[axis])
+    else:
+        raise ValueError
 
 
 @pytest.fixture(scope="session")
@@ -585,12 +654,95 @@ def test_make_background_2d(observations):
     "pars",
     [
         {
-            "geom": geom(ebounds=[0.1, 1, 10], map_type="wcs"),
+            "map_type": "wcs-reco",
+            "ebounds": [0.1, 1, 10],
+            "shape": (2, 3, 4),
+            "sum": 1051.960299,
+        },
+        {
+            "map_type": "wcs-reco",
+            "ebounds": [0.1, 10],
+            "shape": (1, 3, 4),
+            "sum": 1051.960299,
+        },
+        # TODO: make this work for HPX
+        # 'HpxGeom' object has no attribute 'separation'
+        # {
+        #     'geom': geom(map_type='hpx', ebounds=[0.1, 1, 10]),
+        #     'shape': '???',
+        #     'sum': '???',
+        # },
+    ],
+)
+def test_make_background(bkg_3d, pars, fixed_pointing_info):
+    test_obs = Observation.create(
+        pointing=fixed_pointing_info,
+        location=EarthLocation(lon=0, lat=0),
+        tstart=Time("2020-01-01T20:00:00"),
+        livetime=42 * u.second,
+        irfs={"bkg": bkg_3d},
+    )
+    m = MapDatasetMaker.make_background(
+        geom=geom(
+            map_type=pars["map_type"],
+            ebounds=pars["ebounds"],
+            skydir=fixed_pointing_info.fixed_icrs,
+        ),
+        observation=test_obs,
+        fov_rotation_step=1.0 * u.deg,
+        oversampling=10,
+    )
+
+    assert m.data.shape == pars["shape"]
+    assert m.unit == ""
+    assert_allclose(m.data.sum(), pars["sum"], rtol=1e-5)
+
+
+def make_map_background_irf_with_symmetry(fpi, symmetry="constant"):
+    axis = MapAxis.from_edges([0.1, 1, 10], name="energy", unit="TeV", interp="log")
+    test_obs = Observation.create(
+        pointing=fpi,
+        location=EarthLocation(lon=0, lat=0),
+        tstart=Time("2020-01-01T20:00:00"),
+        livetime=42 * u.second,
+        irfs={"bkg": fake_bkg_3d_custom(symmetry)},
+    )
+
+    return MapDatasetMaker.make_background(
+        geom=WcsGeom.create(npix=(3, 3), binsz=4, axes=[axis], skydir=fpi.fixed_icrs),
+        observation=test_obs,
+        fov_rotation_step=1.0 * u.deg,
+    )
+
+
+@requires_data()
+def test_bkg_map_asym(fixed_pointing_info_aligned):
+    m = make_map_background_irf_with_symmetry(
+        fpi=fixed_pointing_info_aligned, symmetry="asymmetric"
+    )
+    for d in m.data:
+        # TODO:
+        #  Dimensions of skymap data are [energy, lat, lon] (and is
+        #  represented as [lon, lat, energy] in the api, but the bkg irf
+        #  dimensions are currently [energy, lon, lat] - Will be changed in
+        #  the future (perhaps when IRFs use the skymaps class)
+        assert_allclose(d[1, 0], d[1, 2], rtol=1e-4)  # Symmetric along lon
+        assert_allclose(d[0, 1] * 9, d[2, 1], rtol=1e-4)  # Asymmetric along lat
+        with pytest.raises(AssertionError):
+            assert_allclose(d[0, 1], d[2, 1], rtol=1e-4)  # Symmetric along lat
+
+
+@requires_data()
+@pytest.mark.parametrize(
+    "pars",
+    [
+        {
+            "geom": geom(ebounds=[0.1, 1, 10], map_type="wcs-true"),
             "shape": (2, 3, 4),
             "sum": 8.103974e08,
         },
         {
-            "geom": geom(ebounds=[0.1, 10], map_type="wcs"),
+            "geom": geom(ebounds=[0.1, 10], map_type="wcs-true"),
             "shape": (1, 3, 4),
             "sum": 2.387916e08,
         },
